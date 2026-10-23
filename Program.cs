@@ -30,6 +30,13 @@ namespace VoskKimiBridge
         [STAThread]
         private static void Main()
         {
+            // Логируем необработанные исключения (управляемые; нативный
+            // краш libvosk они не спасут, но диагностику дают).
+            AppDomain.CurrentDomain.UnhandledException += (_, args) =>
+                Log($"НЕОБРАБОТАННОЕ ИСКЛЮЧЕНИЕ: {args.ExceptionObject}");
+            Application.ThreadException += (_, args) =>
+                Log($"Исключение UI-потока: {args.Exception}");
+
             // Защита от двойного запуска.
             using var mutex = new Mutex(true, @"Global\VoskKimiBridgeCSharpMutex", out bool createdNew);
             if (!createdNew)
@@ -88,6 +95,10 @@ namespace VoskKimiBridge
         private bool _listening;
         private readonly StringBuilder _sessionText = new();
         private readonly System.Windows.Forms.Timer _topmostTimer = new() { Interval = 1000 };
+        // Блокировка доступа к распознавателю: аудио-колбэк (поток NAudio)
+        // и выключение микрофона (UI-поток) не должны пересекаться —
+        // иначе Dispose во время AcceptWaveform роняет libvosk.
+        private readonly object _recLock = new();
 
         // Константы SetWindowPos: окно всегда поверх остальных.
         private static readonly IntPtr HWND_TOPMOST = new(-1);
@@ -108,7 +119,7 @@ namespace VoskKimiBridge
             TopMost = true;
             StartPosition = FormStartPosition.Manual;
             Size = new Size(210, 62);
-            var area = Screen.PrimaryScreen.WorkingArea;
+            var area = (Screen.PrimaryScreen ?? Screen.AllScreens[0]).WorkingArea;
             Location = new Point(area.Right - Width - 12, area.Bottom - Height - 12);
 
             _micButton = new Button
@@ -211,7 +222,10 @@ namespace VoskKimiBridge
                     }
                     else
                     {
-                        ToggleMicrophone();
+                        // ВАЖНО: только через UI-поток! Прямой вызов из потока
+                        // хука гонялся с аудио-колбэком и ронял libvosk
+                        // (access violation, краш процесса).
+                        BeginInvoke(new Action(ToggleMicrophone));
                     }
                     return (IntPtr)1; // поглощаем клавишу, в приложения она не уходит
                 }
@@ -257,22 +271,31 @@ namespace VoskKimiBridge
             if (_waveIn != null)
             {
                 _waveIn.DataAvailable -= OnAudioData;
-                _waveIn.StopRecording();
+                _waveIn.StopRecording(); // ждёт завершения потока записи
                 _waveIn.Dispose();
                 _waveIn = null;
             }
             // Сбрасываем накопленное: если речь шла до самого выключения
             // и паузы не было — фраза иначе потерялась бы.
-            if (_recognizer != null)
+            // Блокировка: гарантирует, что аудио-колбэк уже не внутри
+            // AcceptWaveform, когда мы освобождаем распознаватель.
+            lock (_recLock)
             {
-                var final = ExtractText(_recognizer.FinalResult());
-                if (!string.IsNullOrWhiteSpace(final))
+                if (_recognizer != null)
                 {
-                    Program.Log($"Распознано (при выкл): {final}");
-                    PushToClipboard(final);
+                    try
+                    {
+                        var final = ExtractText(_recognizer.FinalResult());
+                        if (!string.IsNullOrWhiteSpace(final))
+                        {
+                            Program.Log($"Распознано (при выкл): {final}");
+                            PushToClipboard(final);
+                        }
+                    }
+                    catch (Exception ex) { Program.Log($"ОШИБКА финализации: {ex.Message}"); }
+                    try { _recognizer.Dispose(); } catch { }
+                    _recognizer = null;
                 }
-                _recognizer.Dispose();
-                _recognizer = null;
             }
             Program.Log($"Сессия завершена, аудиобуферов: {_bufferCount}");
             _bufferCount = 0;
@@ -282,20 +305,31 @@ namespace VoskKimiBridge
 
         private void OnAudioData(object? sender, WaveInEventArgs e)
         {
-            if (!_listening || _recognizer == null)
-                return;
-
-            _bufferCount++;
-            if (_bufferCount % 50 == 0)
-                Program.Log($"Аудио идёт: {_bufferCount} буферов"); // ~5 сек речи
-
-            if (_recognizer.AcceptWaveform(e.Buffer, e.BytesRecorded))
+            lock (_recLock)
             {
-                var text = ExtractText(_recognizer.Result());
-                if (!string.IsNullOrWhiteSpace(text))
+                if (!_listening || _recognizer == null)
+                    return;
+
+                try
                 {
-                    Program.Log($"Распознано: {text}");
-                    PushToClipboard(text);
+                    _bufferCount++;
+                    if (_bufferCount % 50 == 0)
+                        Program.Log($"Аудио идёт: {_bufferCount} буферов"); // ~5 сек речи
+
+                    if (_recognizer.AcceptWaveform(e.Buffer, e.BytesRecorded))
+                    {
+                        var text = ExtractText(_recognizer.Result());
+                        if (!string.IsNullOrWhiteSpace(text))
+                        {
+                            Program.Log($"Распознано: {text}");
+                            PushToClipboard(text);
+                        }
+                    }
+                }
+                catch (Exception ex)
+                {
+                    // Управляемое исключение — логируем, процесс не роняем.
+                    Program.Log($"ОШИБКА распознавания: {ex.Message}");
                 }
             }
         }
