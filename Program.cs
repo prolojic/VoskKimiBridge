@@ -10,11 +10,13 @@
 // Работает полностью офлайн.
 
 using System;
+using System.Collections.Generic;
 using System.Drawing;
 using System.IO;
 using System.Runtime.InteropServices;
 using System.Text;
 using System.Text.Json;
+using System.Text.RegularExpressions;
 using System.Threading;
 using System.Windows.Forms;
 using NAudio.Wave;
@@ -339,6 +341,7 @@ namespace VoskKimiBridge
         // потока, поэтому вызов через BeginInvoke в UI-поток формы.
         private void PushToClipboard(string phrase)
         {
+            phrase = FixTerms(phrase);
             _sessionText.Append(phrase).Append(' ');
             var all = _sessionText.ToString();
             BeginInvoke(() =>
@@ -347,6 +350,82 @@ namespace VoskKimiBridge
                 catch (Exception ex) { Program.Log($"ОШИБКА буфера: {ex.Message}"); }
             });
             Notify("Распознано", phrase);
+        }
+
+        // Словарь технических терминов: VosK пишет их русскими буквами
+        // как слышит («гитхаб», «навис», «автокат»), а нам нужны точные
+        // английские написания. Заменяем после распознавания.
+        // Словарь грузится из terms.json рядом с exe. Файл можно править
+        // в любой момент: бридж замечает изменение и перезагружает словарь
+        // без перезапуска (проверка при каждой замене, по дате файла).
+        // Ключ — как может услышать модель, значение — правильный термин.
+        private static KeyValuePair<string, string>[] _terms = Array.Empty<KeyValuePair<string, string>>();
+        private static DateTime _termsStamp;
+        private static readonly object _termsLock = new();
+
+        private static KeyValuePair<string, string>[] Terms
+        {
+            get
+            {
+                lock (_termsLock)
+                {
+                    try
+                    {
+                        var path = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "terms.json");
+                        var stamp = File.Exists(path) ? File.GetLastWriteTime(path) : DateTime.MinValue;
+                        if (_terms.Length == 0 || stamp != _termsStamp)
+                        {
+                            _terms = LoadTerms(path);
+                            _termsStamp = stamp;
+                            Program.Log($"Словарь терминов: {_terms.Length} форм.");
+                        }
+                    }
+                    catch { }
+                    return _terms;
+                }
+            }
+        }
+
+        private static KeyValuePair<string, string>[] LoadTerms(string path)
+        {
+            var list = new List<KeyValuePair<string, string>>();
+            try
+            {
+                if (File.Exists(path))
+                {
+                    var dict = JsonSerializer.Deserialize<Dictionary<string, string>>(File.ReadAllText(path));
+                    if (dict != null)
+                        foreach (var kv in dict)
+                            list.Add(new KeyValuePair<string, string>(kv.Key, kv.Value));
+                }
+            }
+            catch (Exception ex) { Program.Log($"ОШИБКА загрузки terms.json: {ex.Message}"); }
+
+            // Встроенный запасной минимум, если файла нет.
+            if (list.Count == 0)
+            {
+                list.Add(new("гитхаб", "GitHub"));
+                list.Add(new("навис", "Navisworks"));
+                list.Add(new("автокад", "AutoCAD"));
+                list.Add(new("ревит", "Revit"));
+                list.Add(new("воск", "Vosk"));
+            }
+
+            // Сначала длинные ключи: «бим модель» должна замениться
+            // раньше, чем отдельное «бим».
+            list.Sort((a, b) => b.Key.Length.CompareTo(a.Key.Length));
+            return list.ToArray();
+        }
+
+        private static string FixTerms(string text)
+        {
+            foreach (var (from, to) in Terms)
+            {
+                // Границы слова, чтобы «бим» не ломало «бимера» и т.п.
+                text = Regex.Replace(text, $@"(?<!\w){Regex.Escape(from)}(?!\w)", to,
+                    RegexOptions.IgnoreCase, TimeSpan.FromSeconds(1));
+            }
+            return text;
         }
 
         private void Cleanup()
