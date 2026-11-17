@@ -11,6 +11,22 @@
   <ItemGroup>
     <PackageReference Include="Vosk" Version="0.3.38" />
     <PackageReference Include="NAudio" Version="2.2.1" />
+    <PackageReference Include="Whisper.net" Version="1.9.1" />
+    <PackageReference Include="Whisper.net.Runtime.Vulkan" Version="1.9.1" />
+    <PackageReference Include="Whisper.net.Runtime" Version="1.9.1" />
+  </ItemGroup>
+
+  <!-- Нативные рантаймы Whisper (Vulcan-рантайм + CPU-фолбэк),
+       лежат в репозитории, копируются в вывод рядом с exe. -->
+  <ItemGroup>
+    <None Include="whisper-runtimes\vulkan-win-x64\*.dll">
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+      <TargetPath>runtimes\vulkan\win-x64\%(Filename)%(Extension)</TargetPath>
+    </None>
+    <None Include="whisper-runtimes\cpu-win-x64\*.dll">
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+      <TargetPath>runtimes\win-x64\%(Filename)%(Extension)</TargetPath>
+    </None>
   </ItemGroup>
 
 </Project>

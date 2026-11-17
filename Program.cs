@@ -13,21 +13,45 @@ using System;
 using System.Collections.Generic;
 using System.Drawing;
 using System.IO;
+using System.Linq;
 using System.Runtime.InteropServices;
 using System.Text;
 using System.Text.Json;
 using System.Text.RegularExpressions;
 using System.Threading;
+using System.Threading.Tasks;
 using System.Windows.Forms;
 using NAudio.Wave;
 using Vosk;
+using Whisper.net;
+using Whisper.net.LibraryLoader;
 
 namespace VoskKimiBridge
 {
     internal static class Program
     {
-        private const string ModelPath = @"C:\Users\vm1\vosk-kimi\models\vosk-model-ru-0.42";
-        private const string LogPath = @"C:\Users\vm1\vosk-kimi\bridge.log";
+        // Пути к моделям: сначала как на основном ПК, иначе — в
+        // %USERPROFILE%\vosk-kimi\models, иначе — в папке models рядом с exe.
+        // Так проект работает на любом компьютере без правки кода.
+        private static string ResolveModelPath(string preferred, string fileName)
+        {
+            if (File.Exists(preferred) || Directory.Exists(preferred)) return preferred;
+            var userPath = Path.Combine(
+                Environment.GetFolderPath(Environment.SpecialFolder.UserProfile),
+                "vosk-kimi", "models", fileName);
+            if (File.Exists(userPath) || Directory.Exists(userPath)) return userPath;
+            var localPath = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "models", fileName);
+            if (File.Exists(localPath) || Directory.Exists(localPath)) return localPath;
+            return preferred; // пусть упадёт с понятным исключением о пути
+        }
+
+        private static readonly string ModelPath =
+            ResolveModelPath(@"C:\Users\vm1\vosk-kimi\models\vosk-model-ru-0.42", "vosk-model-ru-0.42");
+        internal static readonly string WhisperModelPath =
+            ResolveModelPath(@"C:\Users\vm1\vosk-kimi\models\ggml-large-v3.bin", "ggml-large-v3.bin");
+        private static readonly string LogPath = Path.Combine(
+            Environment.GetFolderPath(Environment.SpecialFolder.UserProfile),
+            "vosk-kimi", "bridge.log");
 
         [STAThread]
         private static void Main()
@@ -102,6 +126,21 @@ namespace VoskKimiBridge
         // иначе Dispose во время AcceptWaveform роняет libvosk.
         private readonly object _recLock = new();
 
+        // === Whisper: основной движок финального распознавания ===
+        // Vosk слушает в реальном времени и даёт промежуточный текст
+        // (для индикации), но в буфер обмена попадает результат Whisper:
+        // он заметно точнее (large-v3, GPU Vulkan). Инициализация ленивая —
+        // в фоне после старта формы.
+        private WhisperFactory? _whisperFactory;
+        private readonly object _whisperLock = new();
+        private MemoryStream _sessionPcm = new();
+        private int _sessionId;
+        private bool _whisperTranscribing;
+        // Была ли в сессии речь по мнению Vosk. Whisper на чистом шуме/
+        // тишине склонен к галлюцинациям («Продолжение следует…») —
+        // если Vosk ничего не слышал, Whisper не вызываем вообще.
+        private bool _sessionHeardSpeech;
+
         // Константы SetWindowPos: окно всегда поверх остальных.
         private static readonly IntPtr HWND_TOPMOST = new(-1);
         private const uint SWP_NOMOVE = 0x0002;
@@ -138,8 +177,37 @@ namespace VoskKimiBridge
             _topmostTimer.Tick += (_, _) => KeepOnTop();
             _topmostTimer.Start();
 
-            Load += (_, _) => { CreateTrayIcon(); InstallHook(); KeepOnTop(); };
+            Load += (_, _) => { CreateTrayIcon(); InstallHook(); KeepOnTop(); InitWhisperInBackground(); };
             FormClosed += (_, _) => Cleanup();
+        }
+
+        // Whisper грузится в фоне: не задерживает старт окна, а к первой
+        // диктовке почти наверняка уже готова.
+        private void InitWhisperInBackground()
+        {
+            Task.Run(() =>
+            {
+                try
+                {
+                    var sw = System.Diagnostics.Stopwatch.StartNew();
+                    lock (_whisperLock)
+                    {
+                        RuntimeOptions.RuntimeLibraryOrder = new List<RuntimeLibrary>
+                        {
+                            RuntimeLibrary.Vulkan,
+                            RuntimeLibrary.Cuda,
+                            RuntimeLibrary.Cpu
+                        };
+                        _whisperFactory = WhisperFactory.FromPath(Program.WhisperModelPath);
+                    }
+                    Program.Log($"Whisper готов за {sw.Elapsed.TotalSeconds:F0} с, рантайм: {RuntimeOptions.LoadedLibrary}");
+                }
+                catch (Exception ex)
+                {
+                    Program.Log($"Whisper НЕДОСТУПЕН, остаёмся на Vosk: {ex.Message}");
+                    _whisperFactory = null;
+                }
+            });
         }
 
         private void KeepOnTop()
@@ -259,6 +327,9 @@ namespace VoskKimiBridge
 
             _listening = true;
             _sessionText.Clear(); // новая сессия — буфер собирается заново
+            _sessionPcm = new MemoryStream(); // и сырой PCM для Whisper тоже
+            _sessionHeardSpeech = false;
+            _sessionId++;
             Program.Log("Микрофон: ВКЛ — говорите");
             if (_tray != null) _tray.Text = "VoskKimiBridge — микрофон ВКЛ";
             UpdateTrayMenuText();
@@ -281,26 +352,151 @@ namespace VoskKimiBridge
             // и паузы не было — фраза иначе потерялась бы.
             // Блокировка: гарантирует, что аудио-колбэк уже не внутри
             // AcceptWaveform, когда мы освобождаем распознаватель.
+            byte[] pcm;
+            string? voskFinal = null;
             lock (_recLock)
             {
                 if (_recognizer != null)
                 {
                     try
                     {
-                        var final = ExtractText(_recognizer.FinalResult());
-                        if (!string.IsNullOrWhiteSpace(final))
+                        voskFinal = ExtractText(_recognizer.FinalResult());
+                        if (!string.IsNullOrWhiteSpace(voskFinal))
                         {
-                            Program.Log($"Распознано (при выкл): {final}");
-                            PushToClipboard(final);
+                            _sessionHeardSpeech = true;
+                            Program.Log($"Финал (Vosk, индикация): {voskFinal}");
                         }
                     }
                     catch (Exception ex) { Program.Log($"ОШИБКА финализации: {ex.Message}"); }
                     try { _recognizer.Dispose(); } catch { }
                     _recognizer = null;
                 }
+                // Забираем сырой PCM сессии — аудио-колбэк уже остановлен
+                // (DataAvailable отписан до StopRecording), гонки нет.
+                pcm = _sessionPcm.ToArray();
             }
-            Program.Log($"Сессия завершена, аудиобуферов: {_bufferCount}");
+            Program.Log($"Сессия завершена, аудиобуферов: {_bufferCount}, PCM: {pcm.Length / 32000.0:F1} с");
             _bufferCount = 0;
+
+            // === Финальное распознавание — Whisper (точнее Vosk) ===
+            // Не вызываем Whisper, если Vosk не слышал речи (тишина/шум —
+            // Whisper галлюцинирует), и если речь слишком короткая.
+            // Фолбэк на Vosk — только если Whisper совсем недоступен.
+            var factory = _whisperFactory;
+            if (factory == null || pcm.Length < 32000 || !_sessionHeardSpeech)
+            {
+                if (factory != null && !_sessionHeardSpeech)
+                    Program.Log("Vosk не услышал речи — Whisper пропущен (анти-галлюцинация).");
+                if (factory != null && _sessionHeardSpeech && pcm.Length < 32000)
+                    Program.Log("Слишком короткая речь — Whisper пропущен.");
+                TranscribeFallbackVosk(voskFinal);
+                return;
+            }
+
+            var sid = _sessionId;
+            _whisperTranscribing = true;
+            Notify("VoskKimiBridge", "Распознаю (Whisper)…", ToolTipIcon.Info, 2000);
+            Task.Run(async () =>
+            {
+                try
+                {
+                    var sw = System.Diagnostics.Stopwatch.StartNew();
+                    // PCM 16 бит signed → float [-1;1], моно 16 кГц.
+                    var samples = new float[pcm.Length / 2];
+                    for (int i = 0; i < samples.Length; i++)
+                    {
+                        short s = (short)(pcm[2 * i] | (pcm[2 * i + 1] << 8));
+                        samples[i] = s / 32768f;
+                    }
+
+                    var prompt = BuildWhisperPrompt();
+                    var b = factory.CreateBuilder().WithLanguage("ru");
+                    if (!string.IsNullOrEmpty(prompt))
+                        b = b.WithPrompt(prompt);
+
+                    var sb = new StringBuilder();
+                    using (var proc = b.Build())
+                    {
+                        await foreach (var seg in proc.ProcessAsync(samples))
+                            sb.Append(seg.Text);
+                    }
+
+                    var text = sb.ToString().Trim();
+                    Program.Log($"Whisper распознал за {sw.Elapsed.TotalSeconds:F1} с: {text}");
+
+                    if (IsWhisperHallucination(text))
+                    {
+                        Program.Log("Результат Whisper отброшен как типичная галлюцинация.");
+                        return;
+                    }
+
+                    // Только если за это время микрофон не включили заново —
+                    // иначе устаревший результат испортил бы новую сессию.
+                    if (sid == _sessionId && !string.IsNullOrWhiteSpace(text))
+                        BeginInvoke(() => PushToClipboard(text));
+                }
+                catch (Exception ex)
+                {
+                    Program.Log($"ОШИБКА Whisper: {ex.Message}");
+                    BeginInvoke(() => TranscribeFallbackVosk(voskFinal));
+                }
+                finally { _whisperTranscribing = false; }
+            });
+        }
+
+        // Типичные галлюцинации Whisper на тишине/музыке/шуме.
+        // Сравниваем «очищенный» текст: без знаков препинания и пробелов
+        // в начале/конце, регистронезависимо.
+        private static readonly string[] WhisperHallucinations =
+        {
+            "продолжение следует",
+            "продолжение следует...",
+            "субтитры создавал",
+            "субтитры сделал",
+            "подписи создавал",
+            "спасибо за просмотр",
+            "ставьте лайк",
+        };
+
+        private static bool IsWhisperHallucination(string text)
+        {
+            var clean = text.Trim().Trim('.', '!', '?', '…', ' ').ToLowerInvariant();
+            foreach (var h in WhisperHallucinations)
+                if (clean == h.Trim().Trim('.', '…', ' '))
+                    return true;
+            return false;
+        }
+
+        // Фолбэк, если Whisper не загрузился или упал: пушим в буфер
+        // финальный текст Vosk (менее точный, но лучше чем ничего).
+        private void TranscribeFallbackVosk(string? voskFinal)
+        {
+            if (string.IsNullOrWhiteSpace(voskFinal))
+            {
+                Notify("VoskKimiBridge", "Текст не распознан.", ToolTipIcon.Warning, 3000);
+                return;
+            }
+            Program.Log("Фолбэк: в буфер обмена — финал Vosk.");
+            PushToClipboard(voskFinal);
+        }
+
+        // Промпт Whisper: контекст диктования + словарь терминов.
+        // Помогает модели писать «Revit», «Navisworks» и т.п. английскими
+        // буквами ещё до пост-обработки FixTerms.
+        private static string BuildWhisperPrompt()
+        {
+            try
+            {
+                var vals = Terms
+                    .Select(kv => kv.Value)
+                    .Distinct(StringComparer.OrdinalIgnoreCase)
+                    .ToList();
+                if (vals.Count == 0) return "";
+                var p = "Техническое диктование на русском языке, речь идёт о программах, разработке и строительном ПО. Термины: "
+                        + string.Join(", ", vals);
+                return p.Length > 1600 ? p.Substring(0, 1600) : p;
+            }
+            catch { return ""; }
         }
 
         private int _bufferCount;
@@ -314,17 +510,24 @@ namespace VoskKimiBridge
 
                 try
                 {
+                    // Сырой PCM копируем под _recLock — StopMicrophone
+                    // забирает его после того же лока, гонки нет.
+                    _sessionPcm.Write(e.Buffer, 0, e.BytesRecorded);
+
                     _bufferCount++;
                     if (_bufferCount % 50 == 0)
                         Program.Log($"Аудио идёт: {_bufferCount} буферов"); // ~5 сек речи
 
                     if (_recognizer.AcceptWaveform(e.Buffer, e.BytesRecorded))
                     {
+                        // Промежуточный текст Vosk — только индикация.
+                        // В буфер обмена попадает финальный результат Whisper.
                         var text = ExtractText(_recognizer.Result());
                         if (!string.IsNullOrWhiteSpace(text))
                         {
-                            Program.Log($"Распознано: {text}");
-                            PushToClipboard(text);
+                            _sessionHeardSpeech = true;
+                            Program.Log($"Промежуточно (Vosk): {text}");
+                            Notify("Слушаю…", text, ToolTipIcon.Info, 1500);
                         }
                     }
                 }
