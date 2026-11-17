@@ -22,7 +22,7 @@
 ## Требования
 
 - Windows 10/11 (x64).
-- .NET 8 SDK: https://dotnet.microsoft.com/download/dotnet/8.0
+- .NET 10 SDK: https://dotnet.microsoft.com/download/dotnet/10.0
 - Русская модель Vosk **vosk-model-ru-0.42** (~3,5 ГБ, не входит в репозиторий):
   скачать с https://alphacephei.com/vosk/models и распаковать архив.
 - Модель Whisper **ggml-large-v3.bin** (~3,0 ГБ, не входит в репозиторий):
@@ -36,7 +36,7 @@
 
 ## Установка на новый компьютер
 
-1. Установить .NET 8 SDK.
+1. Установить .NET 10 SDK.
 2. `git clone https://github.com/prolojic/VoskKimiBridge.git`
 3. Скачать обе модели (ссылки выше) и положить в `%USERPROFILE%\vosk-kimi\models\`:
    - `vosk-model-ru-0.42\` (папка из архива);
